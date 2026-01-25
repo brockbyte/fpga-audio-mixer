@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>AES67 Mixer Web Control</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #181a20;
+      color: #eee;
+      margin: 0;
+      padding: 16px;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    #connectionStatus {
+      font-size: 0.9rem;
+      margin-bottom: 8px;
+    }
+    .status-box {
+      margin-bottom: 8px;
+      font-size: 0.85rem;
+    }
+    .status-box span {
+      display: inline-block;
+      min-width: 110px;
+    }
+    .mixer-grid {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr); /* 8 Spalten, 2 Reihen */
+      gap: 8px;
+      align-items: stretch;
+    }
+    .channel {
+      background: #242631;
+      border-radius: 8px;
+      padding: 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .channel-title {
+      font-size: 0.75rem;
+      margin-bottom: 2px;
+      opacity: 0.8;
+    }
+    .channel-name {
+      width: 100%;
+      box-sizing: border-box;
+      font-size: 0.75rem;
+      padding: 2px 4px;
+      margin-bottom: 4px;
+      border-radius: 4px;
+      border: 1px solid #3a3c4a;
+      background: #1b1d25;
+      color: #eee;
+    }
+    .channel-name:focus {
+      outline: none;
+      border-color: #4b8cff;
+    }
+    .fader {
+      writing-mode: bt-lr;
+      -webkit-appearance: slider-vertical;
+      width: 24px;
+      height: 120px;
+      margin: 2px 0;
+    }
+    .meter {
+      display: flex;
+      flex-direction: column-reverse;
+      gap: 1px;
+      margin-top: 2px;
+    }
+    .meter-seg {
+      width: 14px;
+      height: 3px;
+      border-radius: 2px;
+      background: #333;
+    }
+    .meter-seg.on {
+      background: #17d65b;
+    }
+    .meter-seg.hot.on {
+      background: #f39c12;
+    }
+    .meter-seg.clip.on {
+      background: #e74c3c;
+    }
+    .pan-container {
+      margin-top: 2px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-size: 0.7rem;
+    }
+    .pan-label {
+      margin-bottom: 2px;
+    }
+    .pan-slider {
+      width: 80px;
+    }
+  
+    .btn-row{
+      display:flex;
+      gap:6px;
+      justify-content:center;
+      margin:6px 0;
+    }
+    .btn{
+      width:32px;
+      height:28px;
+      border-radius:6px;
+      border:1px solid #444;
+      background:#1b1d26;
+      color:#ddd;
+      cursor:pointer;
+      font-weight:700;
+    }
+    .btn.mute.active{
+      background:#a11818;
+      border-color:#d44;
+      color:#fff;
+    }
+    .btn.solo.active{
+      background:#148a2a;
+      border-color:#3dd85e;
+      color:#fff;
+    }
+    .gain-db{
+      text-align:center;
+      font-size:12px;
+      opacity:0.9;
+      margin:4px 0 8px;
+    }
+
+</style>
+</head>
+<body>
+
+<h1>AES67 Mixer Web Control</h1>
+<div id="connectionStatus">WS: <span id="wsStatus">verbinden…</span></div>
+
+<div class="status-box">
+  <span>PTP Zeit: <span id="ptpSec">–</span> s</span>
+  <span>PTP Zeit: <span id="ptpNs">–</span> ns</span>
+  <span>JB Underrun: <span id="jbUnd">0</span></span>
+  <span>Late/Early: <span id="jbLate">0</span>/<span id="jbEarly">0</span></span>
+</div>
+
+<div class="mixer-grid" id="mixerGrid">
+  <!-- Kanäle per JS -->
+</div>
+
+<script>
+  const WS_URL = "ws://" + window.location.hostname + ":8080";
+
+  const state = {
+    gains: Array(16).fill(1023),  // 10-bit 0..1023
+    pans:  Array(16).fill(0),     // s8 -127..127
+    mutes: Array(16).fill(false),
+    soloMask: 0,
+    peaks: Array(16).fill(0),
+    names: Array(16).fill("")
+  };
+
+  const wsStatusEl = document.getElementById('wsStatus');
+  const ptpSecEl = document.getElementById('ptpSec');
+  const ptpNsEl  = document.getElementById('ptpNs');
+  const jbUndEl     = document.getElementById('jbUnd');
+  const jbLateEl    = document.getElementById('jbLate');
+  const jbEarlyEl   = document.getElementById('jbEarly');
+  const mixerGrid   = document.getElementById('mixerGrid');
+
+  const channelElems = [];
+
+  for (let ch = 0; ch < 16; ch++) {
+    const wrap = document.createElement('div');
+    wrap.className = 'channel';
+
+    const title = document.createElement('div');
+    title.className = 'channel-title';
+    title.textContent = 'CH ' + (ch+1);
+    wrap.appendChild(title);
+
+    // Name-Eingabe (16 Zeichen)
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'channel-name';
+    nameInput.maxLength = 16;
+    nameInput.placeholder = 'Name';
+
+nameInput.addEventListener('focus', () => {
+  uiLock[ch].nameFocused = true;
+  lockName(ch);
+});
+nameInput.addEventListener('input', () => {
+  // während tippen: status blocken
+  uiLock[ch].nameFocused = true;
+  lockName(ch);
+});
+nameInput.addEventListener('blur', () => {
+  // kurze Nachlaufzeit, dann wieder status erlauben
+  uiLock[ch].nameFocused = false;
+  lockName(ch);
+});    
+
+    nameInput.addEventListener('change', () => {
+   uiLock[ch].nameFocused = false;
+  lockName(ch);
+        const val = nameInput.value || '';
+      state.names[ch] = val;
+      sendName(ch);
+    });
+    wrap.appendChild(nameInput);
+
+    // Mute/Solo Buttons
+    const btnRow = document.createElement('div');
+    btnRow.className = 'btn-row';
+
+    const muteBtn = document.createElement('button');
+    muteBtn.className = 'btn mute';
+    muteBtn.textContent = 'M';
+    muteBtn.addEventListener('click', () => {
+      state.mutes[ch] = !state.mutes[ch];
+      updateMuteSoloUI(ch);
+      sendChannel(ch);
+    });
+
+    const soloBtn = document.createElement('button');
+    soloBtn.className = 'btn solo';
+    soloBtn.textContent = 'S';
+    soloBtn.addEventListener('click', () => {
+      const bit = (1 << ch) >>> 0;
+      if ((state.soloMask & bit) !== 0) {
+        state.soloMask = 0; // toggle off
+      } else {
+        state.soloMask = bit; // only one active
+      }
+      updateMuteSoloUI(ch);
+      sendChannel(ch);
+    });
+
+    btnRow.appendChild(muteBtn);
+    btnRow.appendChild(soloBtn);
+    wrap.appendChild(btnRow);
+
+    // Gain dB display
+    const gainDb = document.createElement('div');
+    gainDb.className = 'gain-db';
+    gainDb.textContent = '+0.0 dB';
+    wrap.appendChild(gainDb);
+
+
+    // Fader (0..1)
+    const fader = document.createElement('input');
+    fader.type = 'range';
+    fader.className = 'fader';
+    fader.min = 0;
+    fader.max = 1023;
+    fader.step = 1;
+    fader.value = 1023;
+    fader.addEventListener('input', () => {
+      lockGain(ch);
+      const v = parseInt(fader.value, 10) | 0;
+      state.gains[ch] = v;
+      updateGainDbUI(ch);
+      sendChannel(ch);
+    });
+
+// Gain: wenn User anfasst => lock setzen
+fader.addEventListener('pointerdown', () => lockGain(ch));
+fader.addEventListener('pointerup',   () => lockGain(ch));
+fader.addEventListener('pointercancel', () => lockGain(ch));
+fader.addEventListener('touchstart',  () => lockGain(ch), { passive: true });
+fader.addEventListener('touchend',    () => lockGain(ch), { passive: true });
+
+    wrap.appendChild(fader);
+
+    // Meter
+    const meter = document.createElement('div');
+    meter.className = 'meter';
+    const segs = [];
+    const numSegs = 14;
+    for (let i=0; i<numSegs; i++) {
+      const s = document.createElement('div');
+      s.className = 'meter-seg';
+      meter.appendChild(s);
+      segs.push(s);
+    }
+    wrap.appendChild(meter);
+
+    // Pan
+    const panWrap = document.createElement('div');
+    panWrap.className = 'pan-container';
+    const panLabel = document.createElement('div');
+    panLabel.className = 'pan-label';
+    panLabel.textContent = 'Pan L/R';
+    panWrap.appendChild(panLabel);
+
+    const panSlider = document.createElement('input');
+    panSlider.type = 'range';
+    panSlider.className = 'pan-slider';
+    panSlider.min = -127;
+    panSlider.max = 127;
+    panSlider.step = 1;
+    panSlider.value = 0;
+
+panSlider.addEventListener('pointerdown', () => lockPan(ch));
+panSlider.addEventListener('pointerup',   () => lockPan(ch));
+panSlider.addEventListener('pointercancel', () => lockPan(ch));
+panSlider.addEventListener('touchstart',  () => lockPan(ch), { passive: true });
+panSlider.addEventListener('touchend',    () => lockPan(ch), { passive: true });
+
+    panSlider.addEventListener('input', () => {
+      lockPan(ch);
+      const v = parseInt(panSlider.value, 10) | 0;
+      state.pans[ch] = v;
+      sendChannel(ch);
+    });
+    panWrap.appendChild(panSlider);
+
+    wrap.appendChild(panWrap);
+
+    mixerGrid.appendChild(wrap);
+
+    channelElems.push({
+      nameInput,
+      fader,
+      panSlider,
+      segs,
+      muteBtn,
+      soloBtn,
+      gainDb
+    });
+  }
+
+// ---- Gain mapping (10-bit fader -> dB label, with OFF hysteresis) ----
+// OFF zone: 0..4% => OFF, back ON only above 6%
+const OFF_TH = Math.round(1023 * 0.04); // ~41
+const ON_TH  = Math.round(1023 * 0.06); // ~61
+const TOP_TH = Math.round(1023 * 0.60); // ~614  (split point, KEEP NAME!)
+const TOP    = 1023;
+
+const gainOn = Array(16).fill(true);
+
+// "log taper" via exponential interpolation in amplitude domain
+function expoDb(t, db0, db1) {
+  if (t <= 0) return db0;
+  if (t >= 1) return db1;
+
+  const a0 = Math.pow(10, db0 / 20);
+  const a1 = Math.pow(10, db1 / 20);
+  const a  = a0 * Math.pow(a1 / a0, t);
+  return 20 * Math.log10(a);
+}
+
+function gainPosToDb(pos, ch) {
+  pos = Math.max(0, Math.min(1023, pos | 0));
+
+  // hysteresis
+  if (gainOn[ch]) {
+    if (pos <= OFF_TH) gainOn[ch] = false;
+  } else {
+    if (pos >= ON_TH) gainOn[ch] = true;
+  }
+
+  if (!gainOn[ch]) return null; // OFF / -inf
+
+  // piecewise LOG:
+  // 4..60%   => -60..-10 dB
+  // 60..100% => -10..+6 dB
+  if (pos <= TOP_TH) {
+    const a = OFF_TH;
+    const b = TOP_TH;
+    const t = (pos - a) / Math.max(1, (b - a)); // 0..1
+    return expoDb(t, -60, -10);
+  } else {
+    const a = TOP_TH;
+    const b = TOP;
+    const t = (pos - a) / Math.max(1, (b - a)); // 0..1
+    return expoDb(t, -10, +6);
+  }
+}
+
+  function updateGainDbUI(ch) {
+    const db = gainPosToDb(state.gains[ch], ch);
+    if (db === null) {
+      channelElems[ch].gainDb.textContent = 'OFF';
+    } else {
+      channelElems[ch].gainDb.textContent = (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
+    }
+  }
+
+
+  function updateMuteSoloUI(ch) {
+    const muteOn = !!state.mutes[ch];
+    const soloOn = ((state.soloMask >>> ch) & 1) !== 0;
+
+    channelElems[ch].muteBtn.classList.toggle('active', muteOn);
+    channelElems[ch].soloBtn.classList.toggle('active', soloOn);
+
+  }
+
+  // WebSocket Handling
+  let ws;
+  function connectWs() {
+    ws = new WebSocket(WS_URL);
+    wsStatusEl.textContent = 'verbinden…';
+
+    ws.onopen = () => {
+      wsStatusEl.textContent = 'verbunden';
+    };
+
+    ws.onclose = () => {
+      wsStatusEl.textContent = 'getrennt (Retry…)';
+      setTimeout(connectWs, 2000);
+    };
+
+    ws.onerror = () => {
+      wsStatusEl.textContent = 'Fehler (Retry…)';
+    };
+
+    ws.onmessage = ev => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'status') {
+          handleStatus(msg);
+        } else if (msg.type === 'init') {
+          handleInit(msg);
+        }
+      } catch (e) {
+        console.error('Bad WS message', e);
+      }
+    };
+  }
+
+  connectWs();
+
+  function handleInit(msg) {
+    if (Array.isArray(msg.gains)) {
+      for (let i=0; i<16; i++) {
+        const v = (parseInt(msg.gains[i] ?? 1023, 10) | 0);
+        state.gains[i] = v;
+        channelElems[i].fader.value = v;
+        updateGainDbUI(i);
+      }
+    }
+    if (Array.isArray(msg.pans)) {
+      for (let i=0; i<16; i++) {
+        const v = (parseInt(msg.pans[i] ?? 0, 10) | 0);
+        state.pans[i] = v;
+        channelElems[i].panSlider.value = v;
+      }
+    }
+
+    if (Array.isArray(msg.mutes)) {
+      for (let i=0; i<16; i++) {
+        state.mutes[i] = !!msg.mutes[i];
+      }
+    }
+    if (typeof msg.soloMask === 'number') {
+      state.soloMask = msg.soloMask & 0xFFFF;
+    }
+    if (Array.isArray(msg.solos) && msg.solos.length >= 16 && typeof msg.soloMask !== 'number') {
+      let mask = 0;
+      for (let ch=0; ch<16; ch++) if (msg.solos[ch]) mask |= (1<<ch);
+      state.soloMask = mask & 0xFFFF;
+    }
+    for (let i=0; i<16; i++) updateMuteSoloUI(i);
+    if (Array.isArray(msg.names)) {
+      for (let i=0; i<16; i++) {
+        const name = String(msg.names[i] ?? '');
+        state.names[i] = name;
+        channelElems[i].nameInput.value = name;
+      }
+    }
+  }
+
+// ---- Status->UI Update Regeln ----
+// kleine Sperrzeit nach Bedienung (ms), damit Status nicht "zurückzieht"
+const HOLD_OFF_MS = 250;
+
+// Thresholds (float UI-Range)
+// Gain: Q1.15 ~ 1/32767 ≈ 0.0000305, praktisch etwas größer
+const GAIN_EPS = 1;   // ~0.1%
+const PAN_EPS  = 0.002;   // ~0.2%
+
+function nowMs() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
+function abs(x) { return x < 0 ? -x : x; }
+
+// pro Kanal: wann hat der User zuletzt das jeweilige Control angefasst?
+const uiLock = Array.from({ length: 16 }, () => ({
+  gainUntil: 0,
+  panUntil: 0,
+  nameUntil: 0,
+  // "hartes" Editing (focus), um Status während Texteingabe zu blocken
+  nameFocused: false
+}));
+
+function lockGain(ch) { uiLock[ch].gainUntil = nowMs() + HOLD_OFF_MS; }
+function lockPan(ch)  { uiLock[ch].panUntil  = nowMs() + HOLD_OFF_MS; }
+function lockName(ch) { uiLock[ch].nameUntil = nowMs() + HOLD_OFF_MS; }
+
+function canApplyGain(ch) { return nowMs() >= uiLock[ch].gainUntil; }
+function canApplyPan(ch)  { return nowMs() >= uiLock[ch].panUntil; }
+function canApplyName(ch) {
+  if (uiLock[ch].nameFocused) return false;
+  return nowMs() >= uiLock[ch].nameUntil;
+}
+
+
+  function handleStatus(msg) {
+  // Gains
+  if (Array.isArray(msg.gains) && msg.gains.length >= 16) {
+    for (let ch = 0; ch < 16; ch++) {
+      const incoming = Number(msg.gains[ch]);
+      if (!Number.isFinite(incoming)) continue;
+
+      // Nur wenn User nicht gerade bedient
+      if (!canApplyGain(ch)) continue;
+
+      const current = Number(state.gains[ch] ?? 0);
+      if (abs(incoming - current) < GAIN_EPS) continue; // Threshold
+
+      state.gains[ch] = incoming;
+      // IMPORTANT: value setzen triggert i.d.R. kein 'input' Event -> kein Send-Loop
+      channelElems[ch].fader.value = incoming;
+      updateGainDbUI(ch);
+    }
+  }
+
+  // Pans
+  if (Array.isArray(msg.pans) && msg.pans.length >= 16) {
+    for (let ch = 0; ch < 16; ch++) {
+      const incoming = Number(msg.pans[ch]);
+      if (!Number.isFinite(incoming)) continue;
+
+      if (!canApplyPan(ch)) continue;
+
+      const current = Number(state.pans[ch] ?? 0);
+      if (abs(incoming - current) < PAN_EPS) continue;
+
+      state.pans[ch] = incoming;
+      channelElems[ch].panSlider.value = incoming;
+    }
+  }
+
+
+  // Mutes / Solo
+  // Server kann entweder `mutes: [..]` oder `muteMask: number` senden.
+  if (Array.isArray(msg.mutes) && msg.mutes.length >= 16) {
+    for (let ch=0; ch<16; ch++) {
+      state.mutes[ch] = !!msg.mutes[ch];
+      updateMuteSoloUI(ch);
+    }
+  } else if (typeof msg.muteMask === 'number') {
+    const mask = msg.muteMask & 0xFFFF;
+    for (let ch=0; ch<16; ch++) {
+      state.mutes[ch] = ((mask >>> ch) & 1) !== 0;
+      updateMuteSoloUI(ch);
+    }
+  }
+
+  if (typeof msg.soloMask === 'number') {
+    state.soloMask = msg.soloMask & 0xFFFF;
+    for (let ch=0; ch<16; ch++) updateMuteSoloUI(ch);
+  }
+
+  // Solo: Server kann alternativ auch `solos: [..]` senden.
+  if (Array.isArray(msg.solos) && msg.solos.length >= 16) {
+    let mask = 0;
+    for (let ch=0; ch<16; ch++) {
+      if (msg.solos[ch]) mask |= (1 << ch);
+    }
+    state.soloMask = mask & 0xFFFF;
+    for (let ch=0; ch<16; ch++) updateMuteSoloUI(ch);
+  }
+
+  // Names
+  if (Array.isArray(msg.names) && msg.names.length >= 16) {
+    for (let ch = 0; ch < 16; ch++) {
+      const incoming = String(msg.names[ch] ?? '');
+      if (!canApplyName(ch)) continue;
+
+      const current = String(state.names[ch] ?? '');
+      if (incoming === current) continue;
+
+      state.names[ch] = incoming;
+      channelElems[ch].nameInput.value = incoming;
+    }
+  }
+
+ 
+    if (Array.isArray(msg.peaks) && msg.peaks.length >= 16) {
+      for (let ch=0; ch<16; ch++) {
+        state.peaks[ch] = msg.peaks[ch];
+      }
+      updateMeters();
+    }
+    // PTP Zeit (Server sendet ptpSec als String + ptpNs als Number)
+    if (typeof msg.ptpSec === 'string') {
+      ptpSecEl.textContent = msg.ptpSec;
+    }
+    if (typeof msg.ptpNs === 'number') {
+      const ns = (msg.ptpNs >>> 0);
+      ptpNsEl.textContent = ns.toString();
+    }
+if (typeof msg.statUnderrun === 'number') {
+      jbUndEl.textContent = msg.statUnderrun;
+    }
+    if (typeof msg.statLate === 'number') {
+      jbLateEl.textContent = msg.statLate;
+    }
+    if (typeof msg.statEarly === 'number') {
+      jbEarlyEl.textContent = msg.statEarly;
+    }
+  }
+
+  function updateMeters() {
+    for (let ch=0; ch<16; ch++) {
+      const v = state.peaks[ch] / 65535;
+      const elems = channelElems[ch].segs;
+      const n = elems.length;
+      const active = Math.round(v * n);
+      for (let i=0; i<n; i++) {
+        const seg = elems[i];
+        seg.className = 'meter-seg';
+        if (i < active) {
+          if (i > n-2) seg.classList.add('clip', 'on');
+          else if (i > n-4) seg.classList.add('hot', 'on');
+          else seg.classList.add('on');
+        }
+      }
+    }
+  }
+
+  function sendChannel(ch) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const msg = {
+      type: 'setChannel',
+      channel: ch,
+      gain: state.gains[ch],
+      pan:  state.pans[ch],
+      mute: state.mutes[ch],
+      soloMask: state.soloMask
+    };
+    ws.send(JSON.stringify(msg));
+  }
+
+  function sendName(ch) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const msg = {
+      type: 'setName',
+      channel: ch,
+      name: state.names[ch]
+    };
+    ws.send(JSON.stringify(msg));
+  }
+</script>
+
+</body>
+</html>
+
