@@ -1,25 +1,99 @@
 # FPGA Digital Audio Mixer with Network Control
 
+![System Picture](images/Mixerboard.jpg)
+
 This project implements a digital audio mixer on Intel Cyclone 10 LP FPGA with AES67 RTP network audio (48 kHz, 24-bit L24 format).
 Local control is provided by a custom PCB with motorized faders (capacitive touch), buttons, rotary knobs and per-channel OLED displays.
 Additionally there is a web frontend for remote control.
 All code runs purely on hardware for maximum performance, there is no soft-core or any other microcontroller involved.
 
 **Table of Contents**
-1. [System Overview](#system-overview)
-2. [Architecture & Clock Domains](#architecture--clock-domains)
-3. [Detailed Module Specifications](#detailed-module-specifications)
-4. [Signal Formats & Data Paths](#signal-formats--data-paths)
+1. [Hardware Components](#hardware-components)
+2. [System Overview](#system-overview)
+3. [Architecture & Clock Domains](#architecture--clock-domains)
+4. [Detailed Module Specifications](#detailed-module-specifications)
+5. [Signal Formats & Data Paths](#signal-formats--data-paths)
 6. [Configuration Parameters](#configuration-parameters)
 
 ---
+
+## Hardware Components
+
+### Intel Cyclone 10 LP Development Board
+The heart of the digital audio mixer is the Intel Cyclone 10 LP Evaluation Kit. This platform was selected as it provides a few significant benefits:
+
+* sufficient large Cyclone 10 FPGA to implement network, audio and control functionality
+* ingegrated 1G network port
+* a large number of input / output pins
+* on-board JTAG programmer and debugger
+* acceptable price of around 100 EUR
+
+### Control Board Bill of Materials (BOM)
+The custom control surface communicates with the FPGA via a 40-pin GPIO ribbon cable and some more dedicated cables. The board has been designed with KiCad. For the first production batch, I did not take special care of analog signal routing for the ADC for the faders and touch. It works in my environment, however, for the next production run maybe someone with more experience on that could give some hints on the layout ;-)
+
+For this design I selected 60 mm faders, as the board would have become too big with the 100 mm faders. I tried to avoid using SMD components in this early design phase to make manual corrections easy and only used pre-built modules that can be either stacked into sockets or soldered directly.
+
+| Component | Part Number | Quantity | Function |
+| :--- | :--- | :--- | :--- |
+| **Motorized Faders** | **MF60T** | 8 | Behringer 60 mm standard 10k Linear |
+| **Motor Drivers** | **TB6612** (Dual) | 4 | PWM-based motor driver for 8 fader motors |
+| **Touch Sensor** | **MPR121** | 1 | Capacitive touch detection |
+| **I2C Multiplexer** | **PCA9548** | 1 | Individual addressing for the 8 OLED displays |
+| **OLED Displays** | **128x64 I2C** | 8 | Per-channel labels, Pan, and Peak Meters |
+| **Port Expander** | **MCP23017** | 1 | Driving LEDs for Mute and Solo buttons |
+| **Rotary Encoders** | **STEC12** | 8 | Pan control |
+| **Connectors** | 40-pin IDC | 1 | Main interface to the FPGA development board |
+
+---
+
+## Network & Protocol Implementation
+
+### AES67 & SDP
+The mixer adheres to the **AES67 standard** for interoperability with professional Audio-over-IP (AoIP) ecosystems.
+
+* **Fixed Parameters:** To maintain a pure hardware implementation, the stream is fixed at **48 kHz, 24-bit (L24 format)**.
+* **Session Description Protocol (SDP):** A static SDP file is provided to define multicast addresses, ports, and payload types, allowing external receivers to subscribe to the mixer's output.
+
+### Multicast & Switch Strategy
+The system utilizes **IP Multicast** for efficient one-to-many audio distribution.
+
+* **Simplified Implementation:** To reduce FPGA gate usage and complexity, the design **does not implement IGMP Join/Leave messages**. 
+* **Network Requirement:** Because the hardware does not actively "announce" its presence via IGMP, the network switch must be configured for **Static Multicast** or allowed to flood the multicast traffic to the target ports. This trade-off allows for a significantly leaner RTL network stack and is absolutely sufficient for hoem or small studio environments.
+
+### Network Configuration
+
+Since this project implements a pure hardware UDP/IP stack, IP addresses are currently **hardcoded** in the RTL to ensure maximum performance and zero-config startup.
+
+**Current Default Settings**
+My DANTE network has the IP range 192.168.1.0/24. By default, the project is configured with the following static IP addresses:
+
+| Parameter | Default Value | Description |
+| :--- | :--- | :--- |
+| **Mixer IP Address** | `192.168.1.128` | The static IP of the FPGA board |
+| **Frontend Server IP Address** | `192.168.1.100` | The static IP of the python server that receives the status messages |
+| **Subnet Mask** | `255.255.255.0` | Standard Class C subnet |
+| **Gateway** | `192.168.1.1` | Default network gateway |
+| **Multicast Group** | `239.69.1.2` | Destination for AES67 RTP audio streams |
+| **RTP Port** | `5004` | Standard port for RTP audio |
+
+**How to Change IP Addresses**
+If your network environment uses a different subnet, you must update the addresses in the source code before recompiling in Quartus.
+
+1. **FPGA RTL (Hardware):**
+   Look for the hexadecimal representation of the IP:
+   * Example: `32'hC0A80164` corresponds to `192.168.1.100`.
+   
+2. **Web Frontend:**
+   Open the `frontend/config.js` (or similar configuration file in the `/frontend` directory).
+   Update the `MIXER_IP` constant to match the address set in the FPGA:
+   ```javascript
+   const MIXER_IP = "192.168.1.128";
 
 ## System Overview
 
 ### Board
 
-The system consists of a custom PCB that holds the control elements and a Cyclone 10 LP develeopmemt board, that hosts the FPGA and the network interface. 
-Both boards are connected with a 40 pin ribbon cable. The control board is powered with 3,3V from the FPGA board and has an additional 9V power supply for the fader motors.
+The following figure shows the elements on the custom mixer control baord. The control board is powered with 3,3V from the FPGA board and has an additional 9V power supply for the fader motors.
 
 **Board Picture**
 
@@ -102,7 +176,6 @@ It can sends updates to the mixer and receives regular status updates from the F
 - Automatic 48 kHz audio clock generation locked to master timing
 - PI servo controller for precise frequency tracking
 - Anti-windup and wrap-safe counter management
-- Holdover capability for hours without master clock
 
 **Network & Telemetry**
 - UDP status packet streaming (port 7880) with complete mixer state snapshot
@@ -256,49 +329,28 @@ fpga.v (Top-Level Wrapper)
 
 **Architecture**:
 ```
-Input Stage (16 channels):
+3-Stage Pipeline (16 channels):
     24-bit signed samples (Q.23 format, range: -2^23 to +2^23-1)
         │
-        ├─ Gain Application (Stage 1)
-        │  └─ Q.14 coefficient × 24-bit sample → 40-bit intermediate
+        ├─ Register Inputs (Stage 0)
+        │  └─ 32 x Q.14 coefficients (left + right)
+        │  └─ 16 x 24-bit sample
         │
-        ├─ Pan Law Application (Stage 2)
+        ├─ Multiplication (Stage 1)
+        │  └─ 32 x 40 bit product
         │  ├─ Left: sample × left_coeff (Q.14)
         │  └─ Right: sample × right_coeff (Q.14)
         │
-        ├─ Stereo Accumulation (Stage 3)
-        │  ├─ Summed_Left = Σ(sample[0:15] × left_coeff)
-        │  └─ Summed_Right = Σ(sample[0:15] × right_coeff)
+        ├─ Accumulation (Stage 2) - Adder Tree Part 1 (group of 4)
+        │  ├─ 4 x Summed_Left = Σ(product(0*i:3*i))
+        │  └─ 4 x Summed_Right = Σ(product(0*i:3*i))
         │
-        └─ Bus Headroom Attenuation
+        └─ Final Result + Bus Headroom Attenuation (Stage 3)
            ├─ Applied to prevent overflow (16 inputs can sum to large value)
            ├─ Configurable: BUS_HEADROOM_BITS = 2 (default ~12 dB reduction)
-           └─ Result: 32-bit signed output per channel
-
-Output (2 channels):
-    32-bit signed: -2^31 to +2^31-1 (Q.31 or 32-bit integer)
-```
-
-**3-Stage Pipeline**:
-- Matches 48 kHz sample rate at 50 MHz clock (1041.67 cycles per sample)
-- Stage 1: Gain multiplication
-- Stage 2: Pan coefficient application  
-- Stage 3: Accumulation + headroom attenuation
-- Output timing: Valid signal propagated through 3 stages
-
-**Control Signals**:
-```verilog
-input [15:0] gain[9:0];      // Per-channel 10-bit gain (0-1023 = 0 to -60 dB)
-input [15:0] pan[7:0];       // Per-channel 8-bit signed pan (-128 to +127)
-input [15:0] mute;           // Mute mask (bit=1 to mute channel)
-input [15:0] solo;           // Solo mask (bit=1 to solo channel)
+           └─ Result: 32-bit signed, will be reduced to 24 bit output
 
 ```
-
-**Fixed-Point Formats**:
-- **Input**: Q.23 (24-bit audio samples)
-- **Gain Coefficients**: Q.14 (covers -2 to +2, useful range 0 to 1)
-- **Output**: 32-bit signed (accommodates 16-channel sum)
 
 ---
 
@@ -413,18 +465,11 @@ Applied to Clock:
 
 **Round-Robin Scanning**:
 ```
-Scan Pattern:
-├─ Channel 0: read, store
-├─ Channel 1: read, store
-├─ ...
-├─ Channel 7: read, store
-└─ Loop back to Channel 0
-
 Timing (400 kHz SPI):
 ├─ 3 bytes × 8 bits = 24 SPI clocks
 ├─ At 400 kHz: 60 µs per channel
 ├─ 8 channels: ~480 µs cycle time
-├─ Effective sample rate: ~2 kHz per channel
+└─ Fast enough for effective sample rate: ~2 kHz per channel
 ```
 
 ##### `fader_channel_logic_10b_int.v` - Motor Servo Controller
@@ -490,19 +535,19 @@ Time    Error    P        I        Output    Motor Action
 
 **Button Mapping** (16 buttons total):
 ```
-Buttons 0-7: Mute controls (independent toggle per channel)
-    ├─ Button 0 = Mute Channel 0
-    ├─ Button 1 = Mute Channel 1
-    └─ ... Button 7 = Mute Channel 7
+Buttons 8-15: Mute controls (independent toggle per channel)
+    ├─ Button 8 = Mute Channel 0
+    ├─ Button 9 = Mute Channel 1
+    └─ ...
     
     Logic per channel:
     ├─ On press: mute[ch] = NOT mute[ch]  (toggle)
     └─ Held: no additional action (edge-triggered)
 
-Buttons 8-15: Solo controls (one-hot with toggle-off)
-    ├─ Button 8 = Solo Channel 0
-    ├─ Button 9 = Solo Channel 1
-    └─ ... Button 15 = Solo Channel 7
+Buttons 0-7: Solo controls (one-hot with toggle-off)
+    ├─ Button 0 = Solo Channel 0
+    ├─ Button 1 = Solo Channel 1
+    └─ ...
     
     Logic:
     ├─ If solo[ch] = 0 (not currently solo):
@@ -911,7 +956,6 @@ Value Range:        -2^23 to +2^23-1 (-8,388,608 to +8,388,607)
 Normalized:         -1.0 to +0.9999... (symmetric range)
 Bit Width:          24 bits
 Fixed-Point Format: Q.23 (1 sign + 23 magnitude)
-LSB Value:          ~0.119 µV (at 3.3V reference)
 Dynamic Range:      24 × 6.02 dB/bit ≈ 144 dB
 
 RTP/Network Encoding (3-byte big-endian):
@@ -919,10 +963,6 @@ RTP/Network Encoding (3-byte big-endian):
 ├─ Byte 1:       bits [15:8]
 └─ Byte 2 (LSB): bits [7:0]
 
-Internal Processing:
-├─ Input to mixer:    24-bit signed integer
-├─ Pan coefficients:  Q.14 (16-bit fixed-point)
-└─ Output from mixer: 32-bit signed accumulator
 ```
 
 ### Control Signal Formats
