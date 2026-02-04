@@ -6,4 +6,4 @@ There is an error in the schematic and board layout. **PIN 36 of the 40 pin conn
 
 **You need to solder a connection manually between these two pins.**
 
-See the reference image: [../images/wire_mcp3008.jpg](../images/wire_mcp3008.jpg)
+![Board Correction](/images/Verbindung.jpg)
