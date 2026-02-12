@@ -33,9 +33,6 @@ I also have a limited number of PCBs from the first production run available —
 1. [Hardware Components](#hardware-components)
 2. [System Overview](#system-overview)
 3. [Architecture & Clock Domains](#architecture--clock-domains)
-4. [Detailed Module Specifications](#detailed-module-specifications)
-5. [Signal Formats & Data Paths](#signal-formats--data-paths)
-6. [Configuration Parameters](#configuration-parameters)
 
 ---
 
